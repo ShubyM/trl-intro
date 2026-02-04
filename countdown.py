@@ -10,6 +10,7 @@ Reproduction of: https://samikhan.ai/blog/countdown-rl.html
 import random
 import re
 
+import torch
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
 
@@ -111,20 +112,14 @@ def eval_expression(expr: str, allowed: list[int]) -> float | None:
         return None
 
 
-def get_text(completion) -> str:
-    if isinstance(completion, list):
-        return completion[0]["content"]
-    return str(completion)
-
-
 # ── Reward functions ───────────────────────────────────────────────
 
 
-def exact_match_reward(prompts, completions, target, numbers, **kwargs):
+def exact_match_reward(prompts: list, completions: list, target, numbers, **kwargs):
     """1.0 if the expression evaluates exactly to the target."""
     rewards = []
-    for comp, tgt, nums in zip(completions, target, numbers):
-        sol = parse_solution(get_text(comp))
+    for completion, tgt, nums in zip(completions, target, numbers):
+        sol = parse_solution(completion[0]["content"])
         if not sol or any(p in sol.lower() for p in GIVE_UP_PHRASES):
             rewards.append(0.0)
             continue
@@ -133,11 +128,11 @@ def exact_match_reward(prompts, completions, target, numbers, **kwargs):
     return rewards
 
 
-def closeness_reward(prompts, completions, target, numbers, **kwargs):
+def closeness_reward(prompts: list, completions: list, target, numbers, **kwargs):
     """Smooth reward: 0.5^(distance/10). Rewards near-misses."""
     rewards = []
-    for comp, tgt, nums in zip(completions, target, numbers):
-        sol = parse_solution(get_text(comp))
+    for completion, tgt, nums in zip(completions, target, numbers):
+        sol = parse_solution(completion[0]["content"])
         if not sol or any(p in sol.lower() for p in GIVE_UP_PHRASES):
             rewards.append(0.0)
             continue
@@ -149,15 +144,15 @@ def closeness_reward(prompts, completions, target, numbers, **kwargs):
     return rewards
 
 
-def format_reward(prompts, completions, **kwargs):
+def format_reward(prompts: list, completions: list, **kwargs):
     """1.0 if output has proper <reasoning>/<solution> XML tags with operators."""
     rewards = []
-    for comp in completions:
-        text = get_text(comp)
+    for completion in completions:
+        content = completion[0]["content"]
         has_tags = bool(
-            re.search(r"<reasoning>.+?</reasoning>", text, re.DOTALL)
-        ) and bool(re.search(r"<solution>.+?</solution>", text, re.DOTALL))
-        sol = parse_solution(text)
+            re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL)
+        ) and bool(re.search(r"<solution>.+?</solution>", content, re.DOTALL))
+        sol = parse_solution(content)
         has_ops = bool(sol and re.search(r"[+\-*/]", sol))
         rewards.append(1.0 if has_tags and has_ops else 0.0)
     return rewards
@@ -181,7 +176,7 @@ def main():
         beta=0.0,
         temperature=1.0,
         reward_weights=[1.0, 0.3, 0.1],
-        bf16=True,
+        bf16=torch.cuda.is_available(),
         gradient_checkpointing=True,
         logging_steps=1,
         log_completions=True,
