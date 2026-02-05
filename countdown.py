@@ -10,6 +10,7 @@ Reproduction of: https://samikhan.ai/blog/countdown-rl.html
 import random
 import re
 
+import matplotlib.pyplot as plt
 import torch
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
@@ -53,13 +54,13 @@ def build_target(rng: random.Random, numbers: list[int]) -> int | None:
     pool = list(numbers)
     rng.shuffle(pool)
 
+    # how many of the numbers to use
     k = rng.randint(2, min(4, len(pool)))
     result = pool[0]
     for i in range(1, k):
         _, fn = rng.choice(ops)
         new_result = fn(result, pool[i])
-        if new_result is None:
-            return None
+        if new_result is None: return None
         result = int(new_result)
     return result if 100 <= result <= 999 else None
 
@@ -94,6 +95,15 @@ def generate_puzzles(n: int, seed: int = 42) -> Dataset:
 
 # ── Reward helpers ─────────────────────────────────────────────────
 
+def get_completion_content(completion):
+    """Safely extract content from completion (str, list of str, or list of dict)."""
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list) and len(completion) > 0:
+        if isinstance(completion[0], dict):
+            return completion[0]["content"]
+        return completion[0]
+    return str(completion)
 
 def parse_solution(text: str) -> str | None:
     m = SOLUTION_RE.search(text)
@@ -121,14 +131,12 @@ def eval_expression(expr: str, allowed: list[int]) -> float | None:
         return None
 
 
-# ── Reward functions ───────────────────────────────────────────────
-
-
-def exact_match_reward(prompts: list, completions: list, target, numbers, **kwargs):
+def exact_match_reward(prompts: list, completions: list, **kwargs):
     """1.0 if the expression evaluates exactly to the target."""
     rewards = []
-    for completion, tgt, nums in zip(completions, target, numbers):
-        sol = parse_solution(completion[0]["content"])
+    for completion, tgt, nums in zip(completions, kwargs["target"], kwargs["numbers"]):
+        content = get_completion_content(completion)
+        sol = parse_solution(content)
         if not sol or any(p in sol.lower() for p in GIVE_UP_PHRASES):
             rewards.append(0.0)
             continue
@@ -141,7 +149,8 @@ def closeness_reward(prompts: list, completions: list, target, numbers, **kwargs
     """Smooth reward: 0.5^(distance/10). Rewards near-misses."""
     rewards = []
     for completion, tgt, nums in zip(completions, target, numbers):
-        sol = parse_solution(completion[0]["content"])
+        content = get_completion_content(completion)
+        sol = parse_solution(content)
         if not sol or any(p in sol.lower() for p in GIVE_UP_PHRASES):
             rewards.append(0.0)
             continue
@@ -157,7 +166,7 @@ def format_reward(prompts: list, completions: list, **kwargs):
     """1.0 if output has proper <reasoning>/<solution> XML tags with operators."""
     rewards = []
     for completion in completions:
-        content = completion[0]["content"]
+        content = get_completion_content(completion)
         has_tags = bool(re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL)) and bool(
             re.search(r"<solution>.+?</solution>", content, re.DOTALL)
         )
@@ -184,6 +193,9 @@ def main():
         learning_rate=1e-6,
         beta=0.0,
         temperature=1.0,
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=0.5,
         reward_weights=[1.0, 0.3, 0.1],
         bf16=torch.cuda.is_available(),
         gradient_checkpointing=True,
@@ -192,6 +204,7 @@ def main():
         save_steps=25,
         eval_strategy="steps",
         eval_steps=25,
+        report_to="tensorboard",
     )
 
     trainer = GRPOTrainer(
@@ -204,6 +217,22 @@ def main():
 
     trainer.train()
     trainer.save_model("countdown-grpo/final")
+
+    # ── Visualization ──────────────────────────────────────────────────
+    # Plot reward over time
+    log_history = trainer.state.log_history
+    steps = [x["step"] for x in log_history if "reward" in x]
+    rewards = [x["reward"] for x in log_history if "reward" in x]
+
+    if rewards:
+        plt.figure(figsize=(10, 6))
+        plt.plot(steps, rewards, label="Average Reward")
+        plt.xlabel("Step")
+        plt.ylabel("Reward")
+        plt.title("Training Reward Progress")
+        plt.grid(True)
+        plt.savefig("reward_curve.png")
+        print("Saved training plot to reward_curve.png")
 
 
 if __name__ == "__main__":
