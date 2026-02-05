@@ -9,6 +9,8 @@ Reproduction of: https://samikhan.ai/blog/countdown-rl.html
 
 import random
 import re
+import json
+import os
 
 import matplotlib.pyplot as plt
 import torch
@@ -28,7 +30,8 @@ SYSTEM_PROMPT = (
 SOLUTION_RE = re.compile(r"<solution>(.*?)</solution>", re.DOTALL)
 GIVE_UP_PHRASES = ["unable", "cannot", "impossible", "no solution", "not possible"]
 LARGE_NUMBERS = [25, 50, 75, 100]
-SMALL_NUMBERS = list(range(1, 11))
+SMALL_NUMBERS = list(range(1, 11)) * 2
+PUZZLES_FILE = os.path.join(os.path.dirname(__file__), "puzzles.json")
 
 
 # ── Dataset ────────────────────────────────────────────────────────
@@ -38,10 +41,44 @@ def sample_numbers(rng: random.Random) -> list[int]:
     """Sample numbers like the real Countdown game: 1-3 large + rest small."""
     num_large = rng.randint(1, 3)
     large = rng.sample(LARGE_NUMBERS, num_large)
-    small = rng.choices(SMALL_NUMBERS, k=6 - num_large)
+    small = rng.sample(SMALL_NUMBERS, 6 - num_large)
     numbers = large + small
     rng.shuffle(numbers)
     return numbers
+
+
+def puzzle_row(numbers: list[int], target: int) -> dict:
+    """Create a training row in TRL chat format."""
+    return {
+        "prompt": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Numbers: {', '.join(map(str, numbers))}\nTarget: {target}",
+            },
+        ],
+        "target": target,
+        "numbers": numbers,
+    }
+
+
+def load_puzzle_cache() -> dict[str, list[dict]]:
+    """Load puzzle cache from disk (expects valid schema)."""
+    if not os.path.exists(PUZZLES_FILE):
+        return {}
+    try:
+        with open(PUZZLES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    return raw.get("by_seed", raw)
+
+
+def save_puzzle_cache(cache: dict[str, list[dict]]) -> None:
+    """Persist puzzle cache to disk."""
+    payload = {"version": 1, "by_seed": cache}
+    with open(PUZZLES_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 def build_target(rng: random.Random, numbers: list[int]) -> int | None:
@@ -65,45 +102,47 @@ def build_target(rng: random.Random, numbers: list[int]) -> int | None:
     return result if 100 <= result <= 999 else None
 
 
+def build_puzzle(rng: random.Random) -> dict | None:
+    """Generate one puzzle candidate using current source-number and target logic."""
+    numbers = sample_numbers(rng)
+    target = build_target(rng, numbers)
+    if target is None:
+        return None
+    return {"numbers": numbers, "target": target}
+
+
 def generate_puzzles(n: int, seed: int = 42) -> Dataset:
     """Generate n solvable countdown puzzles by constructing solutions first."""
-    rng = random.Random(seed)
-    rows = []
+    cache = load_puzzle_cache()
+    seed_key = str(seed)
+    cached = cache.setdefault(seed_key, [])
 
-    while len(rows) < n:
-        numbers = sample_numbers(rng)
-        result = build_target(rng, numbers)
-        if result is None:
-            continue
+    if len(cached) < n:
+        # Keep your generation logic, only appending what is missing.
+        rng = random.Random(seed + len(cached))
+        seen = {(tuple(item["numbers"]), item["target"]) for item in cached}
 
-        rows.append(
-            {
-                "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"Numbers: {numbers}\nTarget: {result}",
-                    },
-                ],
-                "target": result,
-                "numbers": numbers,
-            }
-        )
+        while len(cached) < n:
+            puzzle = build_puzzle(rng)
+            if puzzle is None:
+                continue
+            key = (tuple(puzzle["numbers"]), puzzle["target"])
+            if key in seen:
+                continue
+            seen.add(key)
+            cached.append(puzzle)
 
+        save_puzzle_cache(cache)
+
+    rows = [puzzle_row(item["numbers"], item["target"]) for item in cached[:n]]
     return Dataset.from_list(rows)
 
 
 # ── Reward helpers ─────────────────────────────────────────────────
 
 def get_completion_content(completion):
-    """Safely extract content from completion (str, list of str, or list of dict)."""
-    if isinstance(completion, str):
-        return completion
-    if isinstance(completion, list) and len(completion) > 0:
-        if isinstance(completion[0], dict):
-            return completion[0]["content"]
-        return completion[0]
-    return str(completion)
+    """Extract content from a TRL completion payload."""
+    return completion[0]["content"]
 
 def parse_solution(text: str) -> str | None:
     m = SOLUTION_RE.search(text)
@@ -131,13 +170,26 @@ def eval_expression(expr: str, allowed: list[int]) -> float | None:
         return None
 
 
-def exact_match_reward(prompts: list, completions: list, **kwargs):
+def eval_arithmetic(expr: str) -> float | None:
+    """Evaluate arithmetic expression without number-pool checks."""
+    if not re.fullmatch(r"[\d+\-*/().\s]+", expr):
+        return None
+    try:
+        return float(eval(expr))
+    except Exception:
+        return None
+
+
+# ── Reward functions ───────────────────────────────────────────────
+
+
+def exact_match_reward(prompts: list, completions: list, target, numbers, **kwargs):
     """1.0 if the expression evaluates exactly to the target."""
     rewards = []
-    for completion, tgt, nums in zip(completions, kwargs["target"], kwargs["numbers"]):
+    for completion, tgt, nums in zip(completions, target, numbers):
         content = get_completion_content(completion)
         sol = parse_solution(content)
-        if not sol or any(p in sol.lower() for p in GIVE_UP_PHRASES):
+        if not sol or is_give_up(sol):
             rewards.append(0.0)
             continue
         result = eval_expression(sol, nums)
@@ -151,10 +203,10 @@ def closeness_reward(prompts: list, completions: list, target, numbers, **kwargs
     for completion, tgt, nums in zip(completions, target, numbers):
         content = get_completion_content(completion)
         sol = parse_solution(content)
-        if not sol or any(p in sol.lower() for p in GIVE_UP_PHRASES):
+        if not sol or is_give_up(sol):
             rewards.append(0.0)
             continue
-        result = eval_expression(sol, nums)
+        result = eval_arithmetic(sol)
         if result is None:
             rewards.append(0.0)
         else:
@@ -163,16 +215,21 @@ def closeness_reward(prompts: list, completions: list, target, numbers, **kwargs
 
 
 def format_reward(prompts: list, completions: list, **kwargs):
-    """1.0 if output has proper <reasoning>/<solution> XML tags with operators."""
+    """Partial format reward: 0.5 for reasoning + 0.5 for valid-looking solution."""
     rewards = []
     for completion in completions:
         content = get_completion_content(completion)
-        has_tags = bool(re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL)) and bool(
-            re.search(r"<solution>.+?</solution>", content, re.DOTALL)
-        )
+        score = 0.0
+        has_reasoning = bool(re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL))
+        if has_reasoning:
+            score += 0.5
+
         sol = parse_solution(content)
-        has_ops = bool(sol and re.search(r"[+\-*/]", sol))
-        rewards.append(1.0 if has_tags and has_ops else 0.0)
+        if sol and not is_give_up(sol):
+            has_ops = bool(re.search(r"[+\-*/]", sol))
+            if has_ops:
+                score += 0.5
+        rewards.append(score)
     return rewards
 
 
@@ -180,22 +237,27 @@ def format_reward(prompts: list, completions: list, **kwargs):
 
 
 def main():
-    train_ds = generate_puzzles(500, seed=42)
-    eval_ds = generate_puzzles(100, seed=123)
+    train_ds = generate_puzzles(400, seed=42)
+    eval_ds = generate_puzzles(80, seed=123)
 
     config = GRPOConfig(
         output_dir="countdown-grpo",
         max_steps=100,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=8,
-        num_generations=4,
-        max_completion_length=512,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        steps_per_generation=1,
+        num_generations=2,
+        num_generations_eval=1,
+        max_completion_length=256,
         learning_rate=1e-6,
         beta=0.0,
         temperature=1.0,
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.5,
+        # CISPO-style objective: detach clipped IS ratio as a coefficient on log-prob.
+        loss_type="cispo",
+        # Use a wider upper clamp to mimic "stable off-policy-ish" settings from async stacks.
+        epsilon_high=8.0,
+        importance_sampling_level="token",
+        use_vllm=False,
         reward_weights=[1.0, 0.3, 0.1],
         bf16=torch.cuda.is_available(),
         gradient_checkpointing=True,
