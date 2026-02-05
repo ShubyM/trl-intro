@@ -43,47 +43,51 @@ def sample_numbers(rng: random.Random) -> list[int]:
     return numbers
 
 
-def generate_puzzles(n: int, seed: int = 42) -> Dataset:
-    """Generate n solvable countdown puzzles by constructing solutions first."""
-    rng = random.Random(seed)
+def build_target(rng: random.Random, numbers: list[int]) -> int | None:
     ops = [
         ("+", lambda a, b: a + b),
         ("-", lambda a, b: a - b),
         ("*", lambda a, b: a * b),
         ("/", lambda a, b: a / b if b != 0 and a % b == 0 else None),
     ]
+    pool = list(numbers)
+    rng.shuffle(pool)
+
+    k = rng.randint(2, min(4, len(pool)))
+    result = pool[0]
+    for i in range(1, k):
+        _, fn = rng.choice(ops)
+        new_result = fn(result, pool[i])
+        if new_result is None:
+            return None
+        result = int(new_result)
+    return result if 100 <= result <= 999 else None
+
+
+def generate_puzzles(n: int, seed: int = 42) -> Dataset:
+    """Generate n solvable countdown puzzles by constructing solutions first."""
+    rng = random.Random(seed)
     rows = []
 
     while len(rows) < n:
         numbers = sample_numbers(rng)
-        pool = list(numbers)
-        rng.shuffle(pool)
+        result = build_target(rng, numbers)
+        if result is None:
+            continue
 
-        k = rng.randint(2, min(4, len(pool)))
-        result = pool[0]
-        for i in range(1, k):
-            _, fn = rng.choice(ops)
-            new_result = fn(result, pool[i])
-            if new_result is None:
-                break
-            result = int(new_result)
-        else:
-            if not (10 <= result <= 999):
-                continue
-
-            rows.append(
-                {
-                    "prompt": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": f"Numbers: {numbers}\nTarget: {result}",
-                        },
-                    ],
-                    "target": result,
-                    "numbers": numbers,
-                }
-            )
+        rows.append(
+            {
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"Numbers: {numbers}\nTarget: {result}",
+                    },
+                ],
+                "target": result,
+                "numbers": numbers,
+            }
+        )
 
     return Dataset.from_list(rows)
 
@@ -94,6 +98,11 @@ def generate_puzzles(n: int, seed: int = 42) -> Dataset:
 def parse_solution(text: str) -> str | None:
     m = SOLUTION_RE.search(text)
     return m.group(1).strip() if m else None
+
+
+def is_give_up(text: str) -> bool:
+    lower = text.lower()
+    return any(p in lower for p in GIVE_UP_PHRASES)
 
 
 def eval_expression(expr: str, allowed: list[int]) -> float | None:
@@ -149,9 +158,9 @@ def format_reward(prompts: list, completions: list, **kwargs):
     rewards = []
     for completion in completions:
         content = completion[0]["content"]
-        has_tags = bool(
-            re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL)
-        ) and bool(re.search(r"<solution>.+?</solution>", content, re.DOTALL))
+        has_tags = bool(re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL)) and bool(
+            re.search(r"<solution>.+?</solution>", content, re.DOTALL)
+        )
         sol = parse_solution(content)
         has_ops = bool(sol and re.search(r"[+\-*/]", sol))
         rewards.append(1.0 if has_tags and has_ops else 0.0)
