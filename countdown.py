@@ -17,7 +17,7 @@ import torch
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
 
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
@@ -237,17 +237,18 @@ def format_reward(prompts: list, completions: list, **kwargs):
 
 
 def main():
-    train_ds = generate_puzzles(400, seed=42)
-    eval_ds = generate_puzzles(80, seed=123)
+    train_ds = generate_puzzles(500, seed=42)
+    eval_ds = generate_puzzles(100, seed=123)
 
     config = GRPOConfig(
         output_dir="countdown-grpo",
         max_steps=100,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
-        steps_per_generation=1,
-        num_generations=2,
-        num_generations_eval=1,
+        # Match blog run: batch_size=128 rollouts_per_example=4.
+        generation_batch_size=128,
+        num_generations=4,
+        num_generations_eval=4,
         max_completion_length=256,
         learning_rate=1e-6,
         beta=0.0,
