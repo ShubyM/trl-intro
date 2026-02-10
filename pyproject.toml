@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "bitsandbytes>=0.45.5; platform_system == 'Linux'",
     "datasets>=4.5.0",
     "matplotlib>=3.10.8",
     "peft>=0.18.1",

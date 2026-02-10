@@ -16,9 +16,11 @@ import matplotlib.pyplot as plt
 import torch
 from datasets import Dataset
 from peft import LoraConfig
+from transformers import BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
-MODEL = "Qwen/Qwen3-4B"
+MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+VLLM_SERVER_BASE_URL = "http://127.0.0.1:8000"
 
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
@@ -241,16 +243,27 @@ def main():
     train_ds = generate_puzzles(500, seed=42)
     eval_ds = generate_puzzles(100, seed=123)
 
+    model_init_kwargs = {
+        "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        "quantization_config": BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        ),
+        "use_cache": False,
+    }
+
     config = GRPOConfig(
         output_dir="countdown-grpo",
         max_steps=100,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        # Match blog run: batch_size=128 rollouts_per_example=4.
-        generation_batch_size=128,
-        num_generations=4,
-        num_generations_eval=4,
-        max_completion_length=512,
+        # QLoRA + split-role vLLM profile for 4xA100-40GB.
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        generation_batch_size=16,
+        num_generations=2,
+        num_generations_eval=2,
+        max_completion_length=192,
         learning_rate=1e-6,
         beta=0.0,
         temperature=1.0,
@@ -259,12 +272,19 @@ def main():
         # Use a wider upper clamp to mimic "stable off-policy-ish" settings from async stacks.
         epsilon_high=8.0,
         importance_sampling_level="token",
+        model_init_kwargs=model_init_kwargs,
+        optim="paged_adamw_8bit",
         use_vllm=True,
-        vllm_server_port=8000,
-        vllm_gpu_memory_utilization=0.3,
+        vllm_mode="server",
+        vllm_server_base_url=VLLM_SERVER_BASE_URL,
+        vllm_server_timeout=600.0,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode="sequence_mask",
+        vllm_importance_sampling_cap=8.0,
         reward_weights=[1.0, 0.3, 0.1],
         bf16=torch.cuda.is_available(),
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1,
         log_completions=True,
         save_steps=25,
@@ -276,7 +296,9 @@ def main():
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        target_modules="all-linear",
         task_type="CAUSAL_LM",
     )
 
