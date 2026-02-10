@@ -20,7 +20,6 @@ from transformers import BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-VLLM_SERVER_BASE_URL = "http://127.0.0.1:8000"
 
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
@@ -275,9 +274,10 @@ def main():
         model_init_kwargs=model_init_kwargs,
         optim="paged_adamw_8bit",
         use_vllm=True,
-        vllm_mode="server",
-        vllm_server_base_url=VLLM_SERVER_BASE_URL,
-        vllm_server_timeout=600.0,
+        vllm_mode="colocate",
+        vllm_tensor_parallel_size=4,
+        vllm_enable_sleep_mode=True,
+        vllm_gpu_memory_utilization=0.5,
         vllm_importance_sampling_correction=True,
         vllm_importance_sampling_mode="sequence_mask",
         vllm_importance_sampling_cap=8.0,
