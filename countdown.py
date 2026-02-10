@@ -15,9 +15,10 @@ import os
 import matplotlib.pyplot as plt
 import torch
 from datasets import Dataset
+from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
-MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+MODEL = "Qwen/Qwen3-8B"
 
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
@@ -270,10 +271,18 @@ def main():
         report_to="tensorboard",
     )
 
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        task_type="CAUSAL_LM",
+    )
+
     trainer = GRPOTrainer(
         model=MODEL,
         reward_funcs=[exact_match_reward, closeness_reward, format_reward],
         args=config,
+        peft_config=peft_config,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
     )
