@@ -18,7 +18,7 @@ from datasets import Dataset
 from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
-MODEL = "Qwen/Qwen3-8B"
+MODEL = "Qwen/Qwen3-4B"
 
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
@@ -244,13 +244,13 @@ def main():
     config = GRPOConfig(
         output_dir="countdown-grpo",
         max_steps=100,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         # Match blog run: batch_size=128 rollouts_per_example=4.
         generation_batch_size=128,
         num_generations=4,
         num_generations_eval=4,
-        max_completion_length=256,
+        max_completion_length=512,
         learning_rate=1e-6,
         beta=0.0,
         temperature=1.0,
@@ -259,7 +259,9 @@ def main():
         # Use a wider upper clamp to mimic "stable off-policy-ish" settings from async stacks.
         epsilon_high=8.0,
         importance_sampling_level="token",
-        use_vllm=False,
+        use_vllm=True,
+        vllm_server_port=8000,
+        vllm_gpu_memory_utilization=0.3,
         reward_weights=[1.0, 0.3, 0.1],
         bf16=torch.cuda.is_available(),
         gradient_checkpointing=True,
