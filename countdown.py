@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 import torch
 from datasets import Dataset
 from peft import LoraConfig
-from transformers import BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -242,47 +241,25 @@ def main():
     train_ds = generate_puzzles(500, seed=42)
     eval_ds = generate_puzzles(100, seed=123)
 
-    model_init_kwargs = {
-        "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        "quantization_config": BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        ),
-        "use_cache": False,
-    }
-
     config = GRPOConfig(
         output_dir="countdown-grpo",
         max_steps=100,
-        # QLoRA + split-role vLLM profile for 4xA100-40GB.
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
-        generation_batch_size=16,
-        num_generations=2,
-        num_generations_eval=2,
+        num_generations=4,
         max_completion_length=192,
         learning_rate=1e-6,
         beta=0.0,
         temperature=1.0,
-        # CISPO-style objective: detach clipped IS ratio as a coefficient on log-prob.
-        loss_type="cispo",
-        # Use a wider upper clamp to mimic "stable off-policy-ish" settings from async stacks.
-        epsilon_high=8.0,
-        importance_sampling_level="token",
-        model_init_kwargs=model_init_kwargs,
-        optim="paged_adamw_8bit",
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_tensor_parallel_size=4,
-        vllm_enable_sleep_mode=True,
-        vllm_gpu_memory_utilization=0.5,
-        vllm_importance_sampling_correction=True,
-        vllm_importance_sampling_mode="sequence_mask",
-        vllm_importance_sampling_cap=8.0,
+        loss_type="grpo",
+        model_init_kwargs={
+            "dtype": torch.bfloat16,
+            "use_cache": False,
+        },
         reward_weights=[1.0, 0.3, 0.1],
-        bf16=torch.cuda.is_available(),
+        bf16=True,
+        fsdp="full_shard",
+        fsdp_config={"auto_wrap_policy": "TRANSFORMER_BASED_WRAP"},
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1,
