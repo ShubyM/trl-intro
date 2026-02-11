@@ -19,6 +19,18 @@ from peft import LoraConfig
 from transformers import BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
+from external_vllm_rollout import (
+    DEFAULT_VLLM_BASE,
+    DEFAULT_VLLM_KEY,
+    DEFAULT_VLLM_TIMEOUT,
+    NullVLLMClient,
+    make_openai_vllm_rollout,
+    resolve_vllm_base_url,
+)
+from trl.trainer import grpo_trainer as grpo_module
+
+grpo_module.VLLMClient = NullVLLMClient
+
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 SYSTEM_PROMPT = (
@@ -288,6 +300,14 @@ def main():
         task_type="CAUSAL_LM",
     )
 
+    base_url = DEFAULT_VLLM_BASE or resolve_vllm_base_url(config)
+    rollout_func = make_openai_vllm_rollout(
+        base_url=base_url,
+        model=MODEL,
+        api_key=DEFAULT_VLLM_KEY,
+        timeout=DEFAULT_VLLM_TIMEOUT,
+    )
+
     trainer = GRPOTrainer(
         model=MODEL,
         reward_funcs=[exact_match_reward, closeness_reward, format_reward],
@@ -295,6 +315,7 @@ def main():
         peft_config=peft_config,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
+        rollout_func=rollout_func,
     )
 
     trainer.train()
