@@ -1,16 +1,15 @@
 """
-Countdown Numbers Game - GRPO Training with TRL
+Countdown GRPO training using TRL's built-in vLLM integration.
 
-Trains a language model to solve arithmetic countdown puzzles using
-Group Relative Policy Optimization (GRPO).
-
-Reproduction of: https://samikhan.ai/blog/countdown-rl.html
+This variant intentionally avoids the custom rollout client so you can
+run the stock `trl vllm-serve` workflow (or colocated vLLM) and scale
+training with `torchrun --nproc_per_node=4 countdown_trl_vllm.py`.
 """
 
-import random
-import re
 import json
 import os
+import random
+import re
 
 import matplotlib.pyplot as plt
 import torch
@@ -18,14 +17,6 @@ from datasets import Dataset
 from peft import LoraConfig
 from transformers import BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
-
-from external_vllm_rollout import (
-    DEFAULT_VLLM_BASE,
-    DEFAULT_VLLM_KEY,
-    DEFAULT_VLLM_TIMEOUT,
-    make_openai_vllm_rollout,
-    resolve_vllm_base_url,
-)
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
@@ -44,11 +35,7 @@ SMALL_NUMBERS = list(range(1, 11)) * 2
 PUZZLES_FILE = os.path.join(os.path.dirname(__file__), "puzzles.json")
 
 
-# ── Dataset ────────────────────────────────────────────────────────
-
-
 def sample_numbers(rng: random.Random) -> list[int]:
-    """Sample numbers like the real Countdown game: 1-3 large + rest small."""
     num_large = rng.randint(1, 3)
     large = rng.sample(LARGE_NUMBERS, num_large)
     small = rng.sample(SMALL_NUMBERS, 6 - num_large)
@@ -58,7 +45,6 @@ def sample_numbers(rng: random.Random) -> list[int]:
 
 
 def puzzle_row(numbers: list[int], target: int) -> dict:
-    """Create a training row in TRL chat format."""
     return {
         "prompt": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -73,7 +59,6 @@ def puzzle_row(numbers: list[int], target: int) -> dict:
 
 
 def load_puzzle_cache() -> dict[str, list[dict]]:
-    """Load puzzle cache from disk (expects valid schema)."""
     if not os.path.exists(PUZZLES_FILE):
         return {}
     try:
@@ -85,7 +70,6 @@ def load_puzzle_cache() -> dict[str, list[dict]]:
 
 
 def save_puzzle_cache(cache: dict[str, list[dict]]) -> None:
-    """Persist puzzle cache to disk."""
     payload = {"version": 1, "by_seed": cache}
     with open(PUZZLES_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -100,20 +84,18 @@ def build_target(rng: random.Random, numbers: list[int]) -> int | None:
     ]
     pool = list(numbers)
     rng.shuffle(pool)
-
-    # how many of the numbers to use
     k = rng.randint(2, min(4, len(pool)))
     result = pool[0]
     for i in range(1, k):
         _, fn = rng.choice(ops)
         new_result = fn(result, pool[i])
-        if new_result is None: return None
+        if new_result is None:
+            return None
         result = int(new_result)
     return result if 100 <= result <= 999 else None
 
 
 def build_puzzle(rng: random.Random) -> dict | None:
-    """Generate one puzzle candidate using current source-number and target logic."""
     numbers = sample_numbers(rng)
     target = build_target(rng, numbers)
     if target is None:
@@ -122,16 +104,13 @@ def build_puzzle(rng: random.Random) -> dict | None:
 
 
 def generate_puzzles(n: int, seed: int = 42) -> Dataset:
-    """Generate n solvable countdown puzzles by constructing solutions first."""
     cache = load_puzzle_cache()
     seed_key = str(seed)
     cached = cache.setdefault(seed_key, [])
 
     if len(cached) < n:
-        # Keep your generation logic, only appending what is missing.
         rng = random.Random(seed + len(cached))
         seen = {(tuple(item["numbers"]), item["target"]) for item in cached}
-
         while len(cached) < n:
             puzzle = build_puzzle(rng)
             if puzzle is None:
@@ -141,18 +120,15 @@ def generate_puzzles(n: int, seed: int = 42) -> Dataset:
                 continue
             seen.add(key)
             cached.append(puzzle)
-
         save_puzzle_cache(cache)
 
     rows = [puzzle_row(item["numbers"], item["target"]) for item in cached[:n]]
     return Dataset.from_list(rows)
 
 
-# ── Reward helpers ─────────────────────────────────────────────────
-
 def get_completion_content(completion):
-    """Extract content from a TRL completion payload."""
     return completion[0]["content"]
+
 
 def parse_solution(text: str) -> str | None:
     m = SOLUTION_RE.search(text)
@@ -165,7 +141,6 @@ def is_give_up(text: str) -> bool:
 
 
 def eval_expression(expr: str, allowed: list[int]) -> float | None:
-    """Evaluate a simple arithmetic expression, checking only allowed numbers are used."""
     if not re.fullmatch(r"[\d+\-*/().\s]+", expr):
         return None
     used = [int(n) for n in re.findall(r"\d+", expr)]
@@ -181,7 +156,6 @@ def eval_expression(expr: str, allowed: list[int]) -> float | None:
 
 
 def eval_arithmetic(expr: str) -> float | None:
-    """Evaluate arithmetic expression without number-pool checks."""
     if not re.fullmatch(r"[\d+\-*/().\s]+", expr):
         return None
     try:
@@ -190,11 +164,7 @@ def eval_arithmetic(expr: str) -> float | None:
         return None
 
 
-# ── Reward functions ───────────────────────────────────────────────
-
-
 def exact_match_reward(prompts: list, completions: list, target, numbers, **kwargs):
-    """1.0 if the expression evaluates exactly to the target."""
     rewards = []
     for completion, tgt, nums in zip(completions, target, numbers):
         content = get_completion_content(completion)
@@ -208,7 +178,6 @@ def exact_match_reward(prompts: list, completions: list, target, numbers, **kwar
 
 
 def closeness_reward(prompts: list, completions: list, target, numbers, **kwargs):
-    """Smooth reward: 0.5^(distance/10). Rewards near-misses."""
     rewards = []
     for completion, tgt, nums in zip(completions, target, numbers):
         content = get_completion_content(completion)
@@ -225,7 +194,6 @@ def closeness_reward(prompts: list, completions: list, target, numbers, **kwargs
 
 
 def format_reward(prompts: list, completions: list, **kwargs):
-    """Partial format reward: 0.5 for reasoning + 0.5 for valid-looking solution."""
     rewards = []
     for completion in completions:
         content = get_completion_content(completion)
@@ -233,7 +201,6 @@ def format_reward(prompts: list, completions: list, **kwargs):
         has_reasoning = bool(re.search(r"<reasoning>.+?</reasoning>", content, re.DOTALL))
         if has_reasoning:
             score += 0.5
-
         sol = parse_solution(content)
         if sol and not is_give_up(sol):
             has_ops = bool(re.search(r"[+\-*/]", sol))
@@ -241,9 +208,6 @@ def format_reward(prompts: list, completions: list, **kwargs):
                 score += 0.5
         rewards.append(score)
     return rewards
-
-
-# ── Training ───────────────────────────────────────────────────────
 
 
 def main():
@@ -273,7 +237,8 @@ def main():
         },
         reward_weights=[1.0, 0.3, 0.1],
         bf16=True,
-        use_vllm=False,
+        use_vllm=True,
+        vllm_mode="server",
         vllm_server_base_url="http://127.0.0.1:8000",
         vllm_server_timeout=600.0,
         gradient_checkpointing=True,
@@ -295,14 +260,6 @@ def main():
         task_type="CAUSAL_LM",
     )
 
-    base_url = DEFAULT_VLLM_BASE or resolve_vllm_base_url(config)
-    rollout_func = make_openai_vllm_rollout(
-        base_url=base_url,
-        model=MODEL,
-        api_key=DEFAULT_VLLM_KEY,
-        timeout=DEFAULT_VLLM_TIMEOUT,
-    )
-
     trainer = GRPOTrainer(
         model=MODEL,
         reward_funcs=[exact_match_reward, closeness_reward, format_reward],
@@ -310,14 +267,11 @@ def main():
         peft_config=peft_config,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        rollout_func=rollout_func,
     )
 
     trainer.train()
     trainer.save_model("countdown-grpo/final")
 
-    # ── Visualization ──────────────────────────────────────────────────
-    # Plot reward over time
     log_history = trainer.state.log_history
     steps = [x["step"] for x in log_history if "reward" in x]
     rewards = [x["reward"] for x in log_history if "reward" in x]
