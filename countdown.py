@@ -19,15 +19,21 @@ from peft import LoraConfig
 from transformers import BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
-from external_vllm_rollout import (
-    DEFAULT_VLLM_BASE,
-    DEFAULT_VLLM_KEY,
-    DEFAULT_VLLM_TIMEOUT,
-    make_openai_vllm_rollout,
-    resolve_vllm_base_url,
-)
-
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+# Colocated vLLM sizing for 4x A100 40GB (Fabric/NVLink) nodes.
+TP_SIZE = 4
+PER_DEVICE_BATCH = 2
+STEPS_PER_GENERATION = 4
+TARGET_MAX_NUM_SEQS = 32  # = PER_DEVICE_BATCH * TP_SIZE * STEPS_PER_GENERATION
+
+calculated_max_seqs = PER_DEVICE_BATCH * TP_SIZE * STEPS_PER_GENERATION
+if calculated_max_seqs != TARGET_MAX_NUM_SEQS:
+    raise ValueError(
+        "Max sequence calculation mismatch: "
+        f"{PER_DEVICE_BATCH} * {TP_SIZE} * {STEPS_PER_GENERATION} = {calculated_max_seqs}"
+        f" (expected {TARGET_MAX_NUM_SEQS})."
+    )
 
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
@@ -253,9 +259,10 @@ def main():
     config = GRPOConfig(
         output_dir="countdown-grpo",
         max_steps=100,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=PER_DEVICE_BATCH,
         gradient_accumulation_steps=8,
         num_generations=4,
+        steps_per_generation=STEPS_PER_GENERATION,
         max_completion_length=192,
         learning_rate=1e-6,
         beta=0.0,
@@ -273,9 +280,10 @@ def main():
         },
         reward_weights=[1.0, 0.3, 0.1],
         bf16=True,
-        use_vllm=False,
-        vllm_server_base_url="http://127.0.0.1:8000",
-        vllm_server_timeout=600.0,
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_tensor_parallel_size=TP_SIZE,
+        vllm_gpu_memory_utilization=0.8,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1,
@@ -295,14 +303,6 @@ def main():
         task_type="CAUSAL_LM",
     )
 
-    base_url = DEFAULT_VLLM_BASE or resolve_vllm_base_url(config)
-    rollout_func = make_openai_vllm_rollout(
-        base_url=base_url,
-        model=MODEL,
-        api_key=DEFAULT_VLLM_KEY,
-        timeout=DEFAULT_VLLM_TIMEOUT,
-    )
-
     trainer = GRPOTrainer(
         model=MODEL,
         reward_funcs=[exact_match_reward, closeness_reward, format_reward],
@@ -310,7 +310,6 @@ def main():
         peft_config=peft_config,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        rollout_func=rollout_func,
     )
 
     trainer.train()
