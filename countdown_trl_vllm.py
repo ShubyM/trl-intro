@@ -20,6 +20,18 @@ from trl import GRPOConfig, GRPOTrainer
 
 MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
+TRAIN_DATASET_SIZE = int(os.environ.get("COUNTDOWN_TRAIN_PUZZLES", "1024"))
+EVAL_DATASET_SIZE = int(os.environ.get("COUNTDOWN_EVAL_PUZZLES", "256"))
+MAX_STEPS = int(os.environ.get("COUNTDOWN_MAX_STEPS", "400"))
+PER_DEVICE_TRAIN_BATCH = int(os.environ.get("COUNTDOWN_PER_DEVICE_BATCH", "1"))
+GRAD_ACCUM_STEPS = int(os.environ.get("COUNTDOWN_GRAD_ACCUM", "4"))
+NUM_GENERATIONS = int(os.environ.get("COUNTDOWN_NUM_GENERATIONS", "4"))
+MAX_COMPLETION_LENGTH = int(os.environ.get("COUNTDOWN_MAX_COMPLETION_LENGTH", "192"))
+LEARNING_RATE = float(os.environ.get("COUNTDOWN_LEARNING_RATE", "8e-7"))
+OUTPUT_DIR = os.environ.get("COUNTDOWN_OUTPUT_DIR", "countdown-grpo")
+VLLM_BASE_URL = os.environ.get("VLLM_SERVER_URL", "http://127.0.0.1:8000")
+VLLM_SERVER_TIMEOUT = float(os.environ.get("VLLM_SERVER_TIMEOUT", "600"))
+
 SYSTEM_PROMPT = (
     "You solve countdown number puzzles. Given a list of numbers and a target, "
     "find an arithmetic expression using the given numbers that equals the target. "
@@ -211,17 +223,24 @@ def format_reward(prompts: list, completions: list, **kwargs):
 
 
 def main():
-    train_ds = generate_puzzles(500, seed=42)
-    eval_ds = generate_puzzles(100, seed=123)
+    train_ds = generate_puzzles(TRAIN_DATASET_SIZE, seed=42)
+    eval_ds = generate_puzzles(EVAL_DATASET_SIZE, seed=123)
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    global_batch = PER_DEVICE_TRAIN_BATCH * GRAD_ACCUM_STEPS * world_size
+    print(
+        f"Global batch (per step): prompts={global_batch}, "
+        f"generations={global_batch * NUM_GENERATIONS}"
+    )
 
     config = GRPOConfig(
-        output_dir="countdown-grpo",
-        max_steps=100,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
-        num_generations=4,
-        max_completion_length=192,
-        learning_rate=1e-6,
+        output_dir=OUTPUT_DIR,
+        max_steps=MAX_STEPS,
+        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH,
+        gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+        num_generations=NUM_GENERATIONS,
+        max_completion_length=MAX_COMPLETION_LENGTH,
+        learning_rate=LEARNING_RATE,
         beta=0.0,
         temperature=1.0,
         loss_type="grpo",
@@ -239,16 +258,16 @@ def main():
         bf16=True,
         use_vllm=True,
         vllm_mode="server",
-        vllm_server_base_url="http://127.0.0.1:8000",
-        vllm_server_timeout=600.0,
+        vllm_server_base_url=VLLM_BASE_URL,
+        vllm_server_timeout=VLLM_SERVER_TIMEOUT,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1,
         log_completions=True,
-        save_steps=25,
+        save_steps=50,
         eval_strategy="steps",
-        eval_steps=25,
-        report_to="tensorboard",
+        eval_steps=50,
+        report_to=[],
     )
 
     peft_config = LoraConfig(
@@ -270,7 +289,7 @@ def main():
     )
 
     trainer.train()
-    trainer.save_model("countdown-grpo/final")
+    trainer.save_model(os.path.join(OUTPUT_DIR, "final"))
 
     log_history = trainer.state.log_history
     steps = [x["step"] for x in log_history if "reward" in x]
